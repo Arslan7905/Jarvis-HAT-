@@ -1,36 +1,21 @@
-export const LOCATION_LABELS = {
-  living_room: 'Living Room',
-  bedroom: 'Bedroom',
-};
+import {
+  buildDeviceStateKey,
+  createInitialDeviceStates,
+  DEFAULT_LOCATION_BY_DEVICE,
+  DEVICE_LABELS,
+  DEVICE_REGISTRY,
+  getDeviceEntriesByDevice,
+  getDeviceLabel,
+  LOCATION_LABELS,
+} from '../automation/deviceRegistry';
 
-export const DEVICE_LABELS = {
-  fan: 'Fan',
-  lights: 'Lights',
-  ac: 'AC',
-};
+export { LOCATION_LABELS, DEVICE_LABELS, buildDeviceStateKey, createInitialDeviceStates, getDeviceLabel };
 
-export const DEVICE_CATALOG = [
-  {
-    device: 'fan',
-    location: 'living_room',
-    label: 'Living Room Fan',
-  },
-  {
-    device: 'lights',
-    location: 'living_room',
-    label: 'Living Room Lights',
-  },
-  {
-    device: 'lights',
-    location: 'bedroom',
-    label: 'Bedroom Lights',
-  },
-  {
-    device: 'ac',
-    location: 'living_room',
-    label: 'Living Room AC',
-  },
-];
+export const DEVICE_CATALOG = DEVICE_REGISTRY.map(({ device, location, label }) => ({
+  device,
+  location,
+  label,
+}));
 
 export const QUICK_PROMPTS = [
   'Turn on the living room fan',
@@ -49,12 +34,6 @@ export const DEFAULT_AI_ENDPOINT =
 export const DEFAULT_HTTP_ENDPOINT = process.env.REACT_APP_ESP32_HTTP_URL || '';
 export const DEFAULT_WEBSOCKET_ENDPOINT =
   process.env.REACT_APP_ESP32_WS_URL || '';
-
-const DEFAULT_LOCATION_BY_DEVICE = {
-  fan: 'living_room',
-  lights: 'living_room',
-  ac: 'living_room',
-};
 
 const ACTION_PATTERNS = {
   on: /\b(turn|switch)\s+on\b|\bstart\b|\benable\b|\bactivate\b/,
@@ -75,31 +54,6 @@ const LOCATION_PATTERNS = [
 const CLAUSE_SPLIT_PATTERN = /\s*(?:,|\band then\b|\bthen\b|\band\b)\s*/;
 const ALL_DEVICES_PATTERN = /\beverything\b|\ball\s+devices?\b|\ball\s+relays?\b/;
 const ALL_PATTERN = /\ball\b|\beverything\b/;
-
-export function buildDeviceStateKey(device, location) {
-  return `${location}:${device}`;
-}
-
-export function createInitialDeviceStates() {
-  return DEVICE_CATALOG.reduce((deviceStates, entry) => {
-    deviceStates[buildDeviceStateKey(entry.device, entry.location)] = 'OFF';
-    return deviceStates;
-  }, {});
-}
-
-export function getDeviceLabel(device, location) {
-  const existingDevice = DEVICE_CATALOG.find(
-    (entry) => entry.device === device && entry.location === location
-  );
-
-  if (existingDevice) {
-    return existingDevice.label;
-  }
-
-  const locationLabel = LOCATION_LABELS[location] || 'Unknown Location';
-  const deviceLabel = DEVICE_LABELS[device] || device;
-  return `${locationLabel} ${deviceLabel}`;
-}
 
 function findMatch(input, patterns, key) {
   const match = patterns.find((entry) => entry.matcher.test(input));
@@ -187,7 +141,7 @@ function buildClarifyMessage(labels) {
 }
 
 function getCatalogEntriesForDevice(device) {
-  return DEVICE_CATALOG.filter((entry) => entry.device === device);
+  return getDeviceEntriesByDevice(device);
 }
 
 function resolveDeviceCommands(
@@ -345,7 +299,7 @@ export function parseVoiceCommand(transcript) {
   const normalizedTranscript = transcript
     .trim()
     .toLowerCase()
-    .replace(/[!?]/g, ' ')
+    .replace(/[!?.,]/g, ' ')
     .replace(/\s+/g, ' ');
 
   if (!normalizedTranscript) {

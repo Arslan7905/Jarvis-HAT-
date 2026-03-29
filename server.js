@@ -3,6 +3,15 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const OpenAI = require('openai');
+const { executeLaptopAction } = require('./server/automation/executor');
+const {
+  getSettingsSnapshot,
+  listSessions,
+  patchSettings,
+  registerSession,
+  revokeOtherSessions,
+  revokeSession,
+} = require('./server/settings/store');
 
 const DEFAULT_PORT = Number(process.env.PORT) || 3001;
 const DEFAULT_OPENAI_MODEL = 'gpt-4o-mini';
@@ -190,6 +199,76 @@ function createApp() {
   app.use(cors(createCorsOptions()));
   app.use(express.json({ limit: '1mb' }));
 
+  app.get('/api/settings', (req, res) => {
+    return res.json(getSettingsSnapshot());
+  });
+
+  app.patch('/api/settings', (req, res) => {
+    const patch = req.body?.patch;
+
+    if (!patch || typeof patch !== 'object' || Array.isArray(patch)) {
+      return res.status(400).json({
+        error: 'A partial settings patch object is required.',
+      });
+    }
+
+    return res.json(patchSettings(patch));
+  });
+
+  app.post('/api/settings/sessions/register', (req, res) => {
+    const sessionId =
+      typeof req.body?.sessionId === 'string' ? req.body.sessionId.trim() : '';
+
+    if (!sessionId) {
+      return res.status(400).json({
+        error: 'Session id is required.',
+      });
+    }
+
+    return res.json(registerSession(sessionId, req.body?.metadata || {}));
+  });
+
+  app.get('/api/settings/sessions', (req, res) => {
+    const currentSessionId =
+      typeof req.query?.currentSessionId === 'string'
+        ? req.query.currentSessionId.trim()
+        : '';
+
+    return res.json(listSessions(currentSessionId));
+  });
+
+  app.delete('/api/settings/sessions/:sessionId', (req, res) => {
+    const targetSessionId =
+      typeof req.params?.sessionId === 'string' ? req.params.sessionId.trim() : '';
+    const currentSessionId =
+      typeof req.query?.currentSessionId === 'string'
+        ? req.query.currentSessionId.trim()
+        : '';
+
+    if (!targetSessionId) {
+      return res.status(400).json({
+        error: 'Target session id is required.',
+      });
+    }
+
+    return res.json(revokeSession(targetSessionId, currentSessionId));
+  });
+
+  app.post('/api/settings/sessions/revoke-others', (req, res) => {
+    const currentSessionId =
+      typeof req.body?.currentSessionId === 'string'
+        ? req.body.currentSessionId.trim()
+        : '';
+
+    if (!currentSessionId) {
+      return res.status(400).json({
+        error: 'Current session id is required.',
+      });
+    }
+
+    return res.json(revokeOtherSessions(currentSessionId));
+  });
+
   // Endpoint that forwards the user's prompt to OpenAI and returns only AI text.
   app.post('/api/ai/chat', async (req, res) => {
     const prompt =
@@ -207,6 +286,25 @@ function createApp() {
     } catch (error) {
       const { status, message, response } = buildErrorResponse(error);
       console.error('AI request failed:', message);
+      return res.status(status).json(response);
+    }
+  });
+
+  app.post('/api/automation/execute', async (req, res) => {
+    const action = req.body?.action;
+
+    if (!action || typeof action !== 'object') {
+      return res.status(400).json({
+        error: 'Structured action payload is required.',
+      });
+    }
+
+    try {
+      const result = await executeLaptopAction(action);
+      return res.json(result);
+    } catch (error) {
+      const { status, message, response } = buildErrorResponse(error);
+      console.error('Laptop automation failed:', message);
       return res.status(status).json(response);
     }
   });

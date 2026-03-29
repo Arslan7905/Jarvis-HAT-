@@ -1,6 +1,34 @@
-# Getting Started with Create React App
+# JarvisAI
 
-This project was bootstrapped with [Create React App](https://github.com/facebook/create-react-app).
+Voice-first Jarvis UI with:
+
+- live wake-word voice control
+- AI backend fallback for general questions
+- structured automation routing
+- direct ESP32 device control over HTTP or WebSocket
+
+## ESP32 Wi-Fi Bring-Up
+
+The app-side HTTP and WebSocket transport already exists.
+
+For the fastest first real-world test:
+
+1. Use HTTP first, not WebSocket.
+2. Flash the sample sketch in [esp32/jarvis_http_relay/jarvis_http_relay.ino](esp32/jarvis_http_relay/jarvis_http_relay.ino)
+3. Follow the setup guide in [docs/esp32-http-setup.md](docs/esp32-http-setup.md)
+4. In the Admin Panel:
+   - disable `Use Mock Devices`
+   - set `Transport Mode` to `HTTP`
+   - set `ESP32 HTTP Endpoint` to `http://<ESP32-IP>/control`
+5. Run `Test device transport`
+6. Try a typed command before voice
+
+The currently documented first relay mapping is:
+
+- `device: "lights"`
+- `location: "living_room"`
+
+That matches the existing frontend registry.
 
 ## Available Scripts
 
@@ -16,6 +44,12 @@ You may also see any lint errors in the console.
 
 Set `REACT_APP_AI_API_URL` if the TV UI should call an AI backend URL other
 than `http://localhost:3001/api/ai/chat`.
+
+You can also set:
+
+- `REACT_APP_ESP32_PROTOCOL=http`
+- `REACT_APP_ESP32_HTTP_URL=http://192.168.1.50/control`
+- `REACT_APP_ESP32_WS_URL=ws://192.168.1.50/ws`
 
 ### `npm run server`
 
@@ -107,6 +141,16 @@ error response.
 
 The TV UI uses this endpoint for general questions while keeping device control
 on the ESP32 transport path.
+
+## ESP32 Transport Notes
+
+The frontend talks to the ESP32 directly from the browser.
+
+- HTTP transport implementation: [src/integrations/esp32/httpTransport.js](src/integrations/esp32/httpTransport.js)
+- WebSocket transport implementation: [src/integrations/esp32/websocketTransport.js](src/integrations/esp32/websocketTransport.js)
+- Feedback parser: [src/utils/jarvis.js](src/utils/jarvis.js)
+
+For HTTP transport, your ESP32 firmware must support CORS and `OPTIONS`.
 
 ### Provider Notes
 

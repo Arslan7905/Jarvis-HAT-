@@ -90,3 +90,25 @@ test('extracts ESP32 feedback and applies device state updates', () => {
 
   expect(nextStates[buildDeviceStateKey('fan', 'living_room')]).toBe('ON');
 });
+
+test('extracts the documented ESP32 HTTP response format', () => {
+  const feedback = extractEsp32Feedback({
+    message: 'Living Room Lights turned on',
+    updates: [
+      {
+        device: 'lights',
+        location: 'living_room',
+        state: 'ON',
+      },
+    ],
+  });
+
+  expect(feedback.message).toBe('Living Room Lights turned on');
+  expect(feedback.updates).toEqual([
+    {
+      device: 'lights',
+      location: 'living_room',
+      state: 'ON',
+    },
+  ]);
+});

@@ -4,20 +4,50 @@ import {
   MantineProvider,
   createTheme,
 } from '@mantine/core';
+import {
+  ACTION_CONTROL_TYPES,
+  ACTION_RESULT_STATUS,
+  ACTION_TYPES,
+  createActionResult,
+} from './automation/actionSchema';
+import {
+  detectControlCommand,
+  normalizeAutomationText,
+  parsePromptToActions,
+} from './automation/actionParser';
+import { validateActionBatch } from './automation/actionValidator';
+import { summarizeActionPlan, summarizeActionResults } from './automation/actionSummary';
+import { createActionQueue } from './automation/actionQueue';
+import { createConfirmationStateMachine } from './automation/confirmationState';
+import {
+  mergeAutomationSettings,
+  readActionLogs,
+  readAutomationSettings,
+  writeActionLogs,
+  writeAutomationSettings,
+} from './automation/settings';
 import JarvisAvatar from './components/JarvisAvatar';
 import SpeechBubble from './components/SpeechBubble';
+import { routeAction } from './automation/actionRouter';
+import { createEsp32Transport } from './integrations/esp32';
+import { sendAiPrompt } from './integrations/aiClient';
+import { executeLaptopAction } from './integrations/laptopClient';
 import {
-  DEFAULT_AI_ENDPOINT,
-  DEFAULT_HTTP_ENDPOINT,
-  DEFAULT_PROTOCOL,
-  DEFAULT_WEBSOCKET_ENDPOINT,
+  buildClientSessionMetadata,
+  getOrCreateSessionId,
+  loadSettingsSnapshot,
+  loadSessionInventory,
+  patchSettingsSnapshot,
+  registerClientSession,
+  revokeOtherSessions,
+  revokeSession,
+  resolveSettingsApiUrl,
+} from './integrations/settingsClient';
+import {
   applyFeedbackUpdates,
   buildFeedbackMessage,
   buildLocalAssistantReply,
   createInitialDeviceStates,
-  extractEsp32Feedback,
-  getDeviceLabel,
-  parseVoiceCommand,
 } from './utils/jarvis';
 
 const theme = createTheme({
@@ -34,13 +64,6 @@ const theme = createTheme({
   },
 });
 
-const STORAGE_KEYS = {
-  aiEndpoint: 'jarvis.ai-endpoint',
-  protocol: 'jarvis.protocol',
-  httpEndpoint: 'jarvis.http-endpoint',
-  websocketEndpoint: 'jarvis.websocket-endpoint',
-};
-
 const initialConversation = [];
 
 const initialStatusPanel = {
@@ -53,25 +76,25 @@ const initialStatusPanel = {
 const MAX_VISIBLE_MESSAGES = 10;
 const WAKE_WORD_PATTERN = /^\s*hey[\s,.-]*jarvis\b[\s,!:.-]*/i;
 
-function readStoredValue(key, fallbackValue) {
-  if (typeof window === 'undefined') {
-    return fallbackValue;
-  }
-
-  try {
-    return window.localStorage.getItem(key) || fallbackValue;
-  } catch (error) {
-    return fallbackValue;
-  }
-}
-
 function wait(delay) {
   return new Promise((resolve) => {
     setTimeout(resolve, delay);
   });
 }
 
-function getConnectionCopy(protocol, status) {
+function getConnectionCopy(protocol, status, useMockDevices = false) {
+  if (useMockDevices) {
+    if (status === 'testing') {
+      return 'Mock devices testing';
+    }
+
+    if (status === 'sending') {
+      return 'Mock devices executing';
+    }
+
+    return 'Mock devices enabled';
+  }
+
   if (protocol === 'http') {
     if (status === 'connected') {
       return 'HTTP endpoint reachable';
@@ -135,38 +158,6 @@ function getAiConnectionCopy(status) {
   return 'AI backend not configured';
 }
 
-function describeCommandTargets(commands) {
-  return commands
-    .map((command) => getDeviceLabel(command.device, command.location))
-    .join(', ');
-}
-
-function buildDispatchMessage(commands) {
-  const targetSummary = describeCommandTargets(commands);
-
-  if (commands.length === 1) {
-    return `Processing ${targetSummary}.`;
-  }
-
-  return `Processing ${commands.length} commands sequentially: ${targetSummary}.`;
-}
-
-function buildQueuedMessage(commands) {
-  const targetSummary = describeCommandTargets(commands);
-
-  if (commands.length === 1) {
-    return `Command sent over WebSocket for ${targetSummary}. Waiting for ESP32 feedback.`;
-  }
-
-  return `Queued ${commands.length} commands over WebSocket for ${targetSummary}. Waiting for ESP32 feedback.`;
-}
-
-function buildBatchSuccessMessage(commands) {
-  return `Completed ${commands.length} commands successfully: ${describeCommandTargets(
-    commands
-  )}.`;
-}
-
 function buildVoiceErrorMessage(errorCode) {
   if (errorCode === 'no-speech') {
     return "Sorry, I didn't catch that. Please try again.";
@@ -191,6 +182,10 @@ function normalizePromptFingerprint(prompt) {
   return prompt.toLowerCase().replace(/\s+/g, ' ').trim();
 }
 
+function normalizeFinalTranscript(prompt) {
+  return String(prompt || '').trim().replace(/\s+/g, ' ');
+}
+
 function extractWakeWordPrompt(prompt) {
   const match = prompt.match(WAKE_WORD_PATTERN);
 
@@ -201,25 +196,59 @@ function extractWakeWordPrompt(prompt) {
   return prompt.slice(match[0].length).trim();
 }
 
+function toSentenceCase(summary) {
+  if (!summary) {
+    return '';
+  }
+
+  return `${summary.charAt(0).toLowerCase()}${summary.slice(1)}`;
+}
+
+function logRouteDecision(decision) {
+  if (
+    typeof console !== 'undefined' &&
+    process.env.NODE_ENV !== 'production'
+  ) {
+    console.info('[Jarvis Routing]', decision);
+  }
+}
+
+function serializeRouteActions(actions = []) {
+  return actions.map((action) => ({
+    type: action.type,
+    summary: action.summary,
+    target: action.target,
+    payload: action.payload,
+    requiresConfirmation: action.requiresConfirmation,
+  }));
+}
+
 function App() {
   const [activity, setActivity] = useState('idle');
   const [recognizedText, setRecognizedText] = useState('');
   const [conversation, setConversation] = useState(initialConversation);
   const [, setDeviceStates] = useState(createInitialDeviceStates);
-  const aiEndpoint = readStoredValue(STORAGE_KEYS.aiEndpoint, DEFAULT_AI_ENDPOINT);
+  const [settings, setSettings] = useState(readAutomationSettings);
+  const [actionLogs, setActionLogs] = useState(readActionLogs);
+  const [pendingConfirmation, setPendingConfirmation] = useState(null);
+  const aiEndpoint = settings.aiEndpoint;
+  const transportProtocol = settings.deviceTransport;
+  const httpEndpoint = settings.httpEndpoint;
+  const websocketEndpoint = settings.websocketEndpoint;
   const [aiStatus, setAiStatus] = useState(() =>
     aiEndpoint.trim() ? 'configured' : 'not_configured'
   );
-  const transportProtocol = readStoredValue(STORAGE_KEYS.protocol, DEFAULT_PROTOCOL);
-  const httpEndpoint = readStoredValue(
-    STORAGE_KEYS.httpEndpoint,
-    DEFAULT_HTTP_ENDPOINT
+  const [connectionStatus, setConnectionStatus] = useState(() =>
+    settings.useMockDevices
+      ? 'connected'
+      : transportProtocol === 'http'
+        ? httpEndpoint.trim()
+          ? 'configured'
+          : 'not_configured'
+        : websocketEndpoint.trim()
+          ? 'disconnected'
+          : 'not_configured'
   );
-  const websocketEndpoint = readStoredValue(
-    STORAGE_KEYS.websocketEndpoint,
-    DEFAULT_WEBSOCKET_ENDPOINT
-  );
-  const [connectionStatus, setConnectionStatus] = useState('not_configured');
   const [statusPanel, setStatusPanel] = useState(initialStatusPanel);
   const [speechSupported, setSpeechSupported] = useState(false);
   const [voiceEnabled, setVoiceEnabled] = useState(false);
@@ -227,6 +256,23 @@ function App() {
   const [speechOutputEnabled, setSpeechOutputEnabled] = useState(true);
   const [chatPanelOpen, setChatPanelOpen] = useState(true);
   const [adminPanelOpen, setAdminPanelOpen] = useState(false);
+  const [settingsSyncState, setSettingsSyncState] = useState({
+    hydrated: false,
+    saving: false,
+    error: '',
+  });
+  const [sessionInventory, setSessionInventory] = useState({
+    currentSessionId: '',
+    sessions: [],
+    loading: true,
+    saving: false,
+    error: '',
+  });
+  const [queueSnapshot, setQueueSnapshot] = useState({
+    busy: false,
+    lastRunStatus: 'idle',
+    currentSummary: '',
+  });
   const [liveReply, setLiveReply] = useState({
     label: 'Jarvis',
     message: 'Replies will stream here while Jarvis speaks.',
@@ -234,9 +280,9 @@ function App() {
     streaming: false,
   });
   const messageCounterRef = useRef(1);
+  const initialAiEndpointRef = useRef(aiEndpoint);
   const timeoutIdsRef = useRef([]);
   const streamTimeoutIdsRef = useRef([]);
-  const socketRef = useRef(null);
   const recognitionRef = useRef(null);
   const recognitionActiveRef = useRef(false);
   const speechUtteranceRef = useRef(null);
@@ -244,6 +290,13 @@ function App() {
   const appendConversationEntryRef = useRef(() => {});
   const processPromptRef = useRef(() => {});
   const promptLockRef = useRef(false);
+  const actionQueueRef = useRef(createActionQueue());
+  const confirmationMachineRef = useRef(createConfirmationStateMachine());
+  const transportRef = useRef(null);
+  const transportFeedbackHandlerRef = useRef(() => {});
+  const currentSessionIdRef = useRef('');
+  const skipNextSettingsSyncRef = useRef(false);
+  const pendingSettingsPatchRef = useRef(null);
   const lastAcceptedPromptRef = useRef({
     fingerprint: '',
     at: 0,
@@ -256,6 +309,59 @@ function App() {
     const nextId = `${speaker}-${messageCounterRef.current}`;
     messageCounterRef.current += 1;
     return nextId;
+  };
+
+  const updateSettings = (updates) => {
+    pendingSettingsPatchRef.current = {
+      ...(pendingSettingsPatchRef.current || {}),
+      ...updates,
+      laptopPermissions: {
+        ...(pendingSettingsPatchRef.current?.laptopPermissions || {}),
+        ...(updates.laptopPermissions || {}),
+      },
+    };
+    setSettings((currentSettings) => ({
+      ...currentSettings,
+      ...updates,
+      laptopPermissions: {
+        ...currentSettings.laptopPermissions,
+        ...(updates.laptopPermissions || {}),
+      },
+    }));
+  };
+
+  const appendActionLog = (entry) => {
+    setActionLogs((currentLogs) =>
+      [
+        {
+          id: `log-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`,
+          at: new Date().toISOString(),
+          ...entry,
+        },
+        ...currentLogs,
+      ].slice(0, 20)
+    );
+  };
+
+  const applySettingsSnapshot = (nextSettings) => {
+    const mergedSettings = mergeAutomationSettings(nextSettings);
+    skipNextSettingsSyncRef.current = true;
+    pendingSettingsPatchRef.current = null;
+    setSettings(mergedSettings);
+    writeAutomationSettings(mergedSettings);
+    return mergedSettings;
+  };
+
+  const applySessionInventorySnapshot = (inventory, overrides = {}) => {
+    setSessionInventory({
+      currentSessionId:
+        inventory?.currentSessionId || currentSessionIdRef.current || '',
+      sessions: inventory?.sessions || [],
+      loading: false,
+      saving: false,
+      error: '',
+      ...overrides,
+    });
   };
 
   const appendConversationEntry = (
@@ -530,306 +636,403 @@ function App() {
       resetActivitySoon();
     }
   };
+  transportFeedbackHandlerRef.current = handleFeedback;
 
-  const sendAiPrompt = async (prompt, attempt = 1) => {
-    const trimmedAiEndpoint = aiEndpoint.trim();
+  const waitForActionQueueToSettle = async (timeout = 1500) => {
+    const startedAt = Date.now();
 
-    if (!trimmedAiEndpoint) {
-      throw new Error('AI backend endpoint is not configured.');
+    while (actionQueueRef.current.isBusy()) {
+      if (Date.now() - startedAt >= timeout) {
+        break;
+      }
+
+      // eslint-disable-next-line no-await-in-loop
+      await wait(60);
     }
+  };
 
-    setAiStatus('sending');
+  const executeStructuredAction = async (action) =>
+    routeAction(action, {
+      device: {
+        execute: async (deviceAction) => {
+          const nextCommand = {
+            device: deviceAction.target.device,
+            location: deviceAction.target.location,
+            action: deviceAction.payload.state.toLowerCase(),
+          };
+          const transport = transportRef.current;
 
-    try {
-      const response = await fetch(trimmedAiEndpoint, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
+          if (!transport) {
+            throw new Error('Device transport is unavailable.');
+          }
+
+          updateStatusPanel('Dispatch', `Executing ${deviceAction.summary}.`, 'pending');
+          const transportResult = await transport.execute(nextCommand);
+          const effectiveUpdates =
+            transportResult.updates && transportResult.updates.length
+              ? transportResult.updates
+              : [
+                  {
+                    device: nextCommand.device,
+                    location: nextCommand.location,
+                    state: nextCommand.action.toUpperCase(),
+                  },
+                ];
+
+          setDeviceStates((currentStates) =>
+            applyFeedbackUpdates(currentStates, effectiveUpdates)
+          );
+
+          return createActionResult(deviceAction, {
+            ok: true,
+            status:
+              transportResult.status === 'mocked'
+                ? ACTION_RESULT_STATUS.MOCKED
+                : ACTION_RESULT_STATUS.SUCCESS,
+            message:
+              transportResult.message || buildFeedbackMessage(effectiveUpdates),
+            data: {
+              updates: effectiveUpdates,
+              transport: transportResult.transport || transport.mode,
+            },
+          });
         },
-        body: JSON.stringify({ prompt }),
-      });
+      },
+      ai: {
+        execute: async (aiAction) => {
+          if (!aiEndpoint.trim()) {
+            const fallbackReply = buildLocalAssistantReply(aiAction.payload.prompt);
+            updateStatusPanel(
+              'AI',
+              'AI backend not configured. Answering locally for now.',
+              'pending'
+            );
 
-      let payload;
+            return createActionResult(aiAction, {
+              ok: true,
+              status: ACTION_RESULT_STATUS.MOCKED,
+              message: fallbackReply,
+              data: {
+                fallback: true,
+              },
+            });
+          }
 
-      try {
-        payload = await response.json();
-      } catch (error) {
-        throw new Error('AI backend returned invalid JSON.');
-      }
+          setAiStatus('sending');
+          updateStatusPanel(
+            'AI',
+            'Sending this question to the secure AI backend.',
+            'pending'
+          );
 
-      if (!response.ok) {
-        throw new Error(payload?.error || `AI backend returned HTTP ${response.status}.`);
-      }
+          try {
+            const reply = await sendAiPrompt(aiEndpoint, aiAction.payload.prompt);
+            setAiStatus('connected');
+            return createActionResult(aiAction, {
+              ok: true,
+              status: ACTION_RESULT_STATUS.SUCCESS,
+              message: reply,
+            });
+          } catch (error) {
+            const fallbackReply = buildLocalAssistantReply(aiAction.payload.prompt);
+            setAiStatus('error');
+            appendActionLog({
+              type: aiAction.type,
+              summary: aiAction.summary,
+              status: ACTION_RESULT_STATUS.ERROR,
+              message: error.message || 'AI request failed.',
+            });
 
-      if (typeof payload?.text !== 'string' || !payload.text.trim()) {
-        throw new Error('AI backend returned an empty reply.');
-      }
-
-      setAiStatus('connected');
-      return payload.text.trim();
-    } catch (error) {
-      if (attempt === 1) {
-        await wait(900);
-        return sendAiPrompt(prompt, 2);
-      }
-
-      setAiStatus('error');
-      throw error;
-    }
-  };
-
-  const sendHttpCommand = async (command, attempt = 1) => {
-    const trimmedEndpoint = httpEndpoint.trim();
-
-    if (!trimmedEndpoint) {
-      throw new Error('ESP32 HTTP endpoint is not configured.');
-    }
-
-    setConnectionStatus('sending');
-
-    try {
-      const response = await fetch(trimmedEndpoint, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
+            return createActionResult(aiAction, {
+              ok: true,
+              status: ACTION_RESULT_STATUS.MOCKED,
+              message: fallbackReply,
+              data: {
+                fallback: true,
+                warning: error.message || 'AI request failed.',
+              },
+            });
+          }
         },
-        body: JSON.stringify(command),
-      });
+      },
+      laptop: {
+        execute: async (laptopAction) => {
+          const operation = laptopAction.target.operation;
 
-      if (!response.ok) {
-        throw new Error(`ESP32 returned HTTP ${response.status}.`);
-      }
+          if (
+            ['shutdown', 'restart', 'sleep'].includes(operation) &&
+            !settings.laptopPermissions.allowPower
+          ) {
+            return createActionResult(laptopAction, {
+              ok: false,
+              status: ACTION_RESULT_STATUS.DENIED,
+              message: 'Power actions are disabled in the admin panel permissions.',
+              haltQueue: true,
+            });
+          }
 
-      const responseText = await response.text();
-      const payload = responseText ? responseText : { message: '' };
+          if (
+            ['open_app', 'close_app'].includes(operation) &&
+            !settings.laptopPermissions.allowApps
+          ) {
+            return createActionResult(laptopAction, {
+              ok: false,
+              status: ACTION_RESULT_STATUS.DENIED,
+              message: 'App automation is disabled in the admin panel permissions.',
+              haltQueue: true,
+            });
+          }
 
-      setConnectionStatus('connected');
-      return extractEsp32Feedback(payload);
-    } catch (error) {
-      if (attempt === 1) {
-        await wait(900);
-        return sendHttpCommand(command, 2);
-      }
+          if (operation === 'open_url' && !settings.laptopPermissions.allowUrls) {
+            return createActionResult(laptopAction, {
+              ok: false,
+              status: ACTION_RESULT_STATUS.DENIED,
+              message: 'URL automation is disabled in the admin panel permissions.',
+              haltQueue: true,
+            });
+          }
 
-      setConnectionStatus('error');
-      throw error;
-    }
-  };
+          if (
+            ['volume_up', 'volume_down', 'mute', 'unmute'].includes(operation) &&
+            !settings.laptopPermissions.allowVolume
+          ) {
+            return createActionResult(laptopAction, {
+              ok: false,
+              status: ACTION_RESULT_STATUS.DENIED,
+              message: 'Volume automation is disabled in the admin panel permissions.',
+              haltQueue: true,
+            });
+          }
 
-  const connectWebSocket = () => {
-    const trimmedEndpoint = websocketEndpoint.trim();
+          updateStatusPanel('Laptop', `Executing ${laptopAction.summary}.`, 'pending');
+          const laptopResult = await executeLaptopAction(laptopAction, {
+            useMock: settings.mockLaptopActions,
+          });
 
-    if (!trimmedEndpoint) {
-      setConnectionStatus('not_configured');
-      updateStatusPanel(
-        'ESP32',
-        'Set a WebSocket endpoint before trying to connect to the ESP32.',
-        'error'
-      );
-      return;
-    }
-
-    if (typeof window === 'undefined' || typeof window.WebSocket === 'undefined') {
-      setConnectionStatus('error');
-      updateStatusPanel(
-        'ESP32',
-        'WebSocket is not available in this browser.',
-        'error'
-      );
-      return;
-    }
-
-    if (
-      socketRef.current &&
-      (socketRef.current.readyState === window.WebSocket.OPEN ||
-        socketRef.current.readyState === window.WebSocket.CONNECTING)
-    ) {
-      return;
-    }
-
-    setConnectionStatus('connecting');
-    updateStatusPanel(
-      'ESP32',
-      'Connecting to the ESP32 over WebSocket.',
-      'pending'
-    );
-
-    const socket = new window.WebSocket(trimmedEndpoint);
-    socketRef.current = socket;
-
-    socket.onopen = () => {
-      setConnectionStatus('connected');
-      updateStatusPanel(
-        'ESP32',
-        'WebSocket connected. Device feedback can stream back to the TV UI.',
-        'success'
-      );
-    };
-
-    socket.onmessage = (event) => {
-      const feedback = extractEsp32Feedback(event.data);
-
-      if (!feedback.updates.length && !feedback.message) {
-        return;
-      }
-
-      handleFeedback(feedback);
-    };
-
-    socket.onerror = () => {
-      setConnectionStatus('error');
-      updateStatusPanel(
-        'ESP32',
-        'WebSocket error. Check the ESP32 IP, port, and Wi-Fi connection.',
-        'error'
-      );
-    };
-
-    socket.onclose = () => {
-      socketRef.current = null;
-      setConnectionStatus(
-        trimmedEndpoint ? 'disconnected' : 'not_configured'
-      );
-      updateStatusPanel(
-        'ESP32',
-        'WebSocket disconnected. Reconnect when the ESP32 is reachable again.',
-        trimmedEndpoint ? 'pending' : 'error'
-      );
-    };
-  };
-
-  const disconnectWebSocket = () => {
-    if (socketRef.current) {
-      socketRef.current.close();
-      socketRef.current = null;
-    }
-  };
-
-  const waitForWebSocketReady = (timeout = 4500) =>
-    new Promise((resolve, reject) => {
-      if (typeof window === 'undefined' || typeof window.WebSocket === 'undefined') {
-        reject(new Error('WebSocket is unavailable in this browser.'));
-        return;
-      }
-
-      if (
-        socketRef.current &&
-        socketRef.current.readyState === window.WebSocket.OPEN
-      ) {
-        resolve(socketRef.current);
-        return;
-      }
-
-      const startedAt = Date.now();
-      const intervalId = window.setInterval(() => {
-        if (
-          socketRef.current &&
-          socketRef.current.readyState === window.WebSocket.OPEN
-        ) {
-          window.clearInterval(intervalId);
-          resolve(socketRef.current);
-          return;
-        }
-
-        if (Date.now() - startedAt >= timeout) {
-          window.clearInterval(intervalId);
-          reject(new Error('WebSocket connection timed out.'));
-        }
-      }, 120);
+          return createActionResult(laptopAction, {
+            ok: Boolean(laptopResult.ok),
+            status:
+              laptopResult.status === 'mocked'
+                ? ACTION_RESULT_STATUS.MOCKED
+                : ACTION_RESULT_STATUS.SUCCESS,
+            message: laptopResult.message,
+            data: laptopResult.data,
+          });
+        },
+      },
     });
 
-  const ensureWebSocketConnection = async () => {
-    if (typeof window === 'undefined' || typeof window.WebSocket === 'undefined') {
-      throw new Error('WebSocket is unavailable in this browser.');
+  const runActionPlan = async (actions, prompt, source, overrideSummary = '') => {
+    setQueueSnapshot({
+      busy: true,
+      lastRunStatus: queueSnapshot.lastRunStatus,
+      currentSummary: overrideSummary || summarizeActionPlan(actions),
+    });
+    setActivity('thinking');
+
+    const runResult = await actionQueueRef.current.run({
+      actions,
+      executeAction: executeStructuredAction,
+      onActionStart: ({ action }) => {
+        setQueueSnapshot((currentSnapshot) => ({
+          ...currentSnapshot,
+          busy: true,
+          currentSummary: action.summary,
+        }));
+        appendActionLog({
+          prompt,
+          source,
+          type: action.type,
+          summary: action.summary,
+          status: 'started',
+          message: 'Action started.',
+        });
+      },
+      onActionResult: ({ action, result }) => {
+        appendActionLog({
+          prompt,
+          source,
+          type: action.type,
+          summary: action.summary,
+          status: result.status,
+          message: result.message,
+        });
+      },
+    });
+
+    const actionableResults = runResult.results.filter(
+      (result) =>
+        result.status !== ACTION_RESULT_STATUS.CANCELLED &&
+        result.status !== ACTION_RESULT_STATUS.INTERRUPTED
+    );
+    const singleResult = actionableResults.length === 1 ? actionableResults[0] : null;
+    const runTone =
+      runResult.status === ACTION_RESULT_STATUS.SUCCESS
+        ? 'success'
+        : runResult.status === ACTION_RESULT_STATUS.CANCELLED ||
+            runResult.status === ACTION_RESULT_STATUS.INTERRUPTED
+          ? 'pending'
+          : actionableResults.some((result) => !result.ok)
+            ? 'error'
+            : 'success';
+    const runMessage =
+      runResult.status === ACTION_RESULT_STATUS.CANCELLED
+        ? 'Cancelled the current action queue.'
+        : runResult.status === ACTION_RESULT_STATUS.INTERRUPTED
+          ? 'Interrupted the previous action queue.'
+          : singleResult
+            ? singleResult.message
+            : summarizeActionResults(actionableResults);
+    const runLabel =
+      singleResult?.type === ACTION_TYPES.AI_QUERY ? 'Jarvis AI' : 'Jarvis';
+
+    if (singleResult?.data?.warning) {
+      appendConversationEntry('assistant', 'Jarvis', singleResult.data.warning, 'error');
     }
 
-    if (
-      socketRef.current &&
-      socketRef.current.readyState === window.WebSocket.OPEN
-    ) {
-      return socketRef.current;
-    }
+    await deliverAssistantMessage(runLabel, runMessage, runTone);
 
-    connectWebSocket();
-    return waitForWebSocketReady();
+    setQueueSnapshot({
+      busy: false,
+      lastRunStatus: runResult.status,
+      currentSummary: '',
+    });
   };
 
-  const sendWebSocketCommand = async (command, attempt = 1) => {
-    try {
-      const socket = await ensureWebSocketConnection();
-      socket.send(JSON.stringify(command));
-    } catch (error) {
-      if (attempt === 1) {
-        disconnectWebSocket();
-        await wait(700);
-        return sendWebSocketCommand(command, 2);
+  const getSingleControlAction = (actions = []) =>
+    actions.length === 1 && actions[0].type === ACTION_TYPES.CONTROL
+      ? actions[0]
+      : null;
+
+  const handleControlAction = async (controlAction) => {
+    if (controlAction.target.control === ACTION_CONTROL_TYPES.CONFIRM) {
+      const pendingRequest = confirmationMachineRef.current.get();
+
+      if (!pendingRequest) {
+        updateStatusPanel(
+          'Confirmation',
+          'There is no pending action waiting for confirmation.',
+          'pending'
+        );
+        await deliverAssistantMessage(
+          'Jarvis',
+          'There is nothing waiting for confirmation right now.',
+          'pending'
+        );
+        return;
       }
 
-      setConnectionStatus('error');
-      throw error;
-    }
-  };
-
-  const dispatchHttpCommands = async (commands) => {
-    for (let index = 0; index < commands.length; index += 1) {
-      const command = commands[index];
-      const deviceLabel = getDeviceLabel(command.device, command.location);
-
-      updateStatusPanel(
-        'Dispatch',
-        `Sending ${index + 1} of ${commands.length}: ${deviceLabel}.`,
-        'pending'
+      confirmationMachineRef.current.clear();
+      setPendingConfirmation(null);
+      stopSpeechOutput();
+      await runActionPlan(
+        pendingRequest.actions,
+        pendingRequest.prompt,
+        pendingRequest.source,
+        pendingRequest.summary
       );
-
-      const feedback = await sendHttpCommand(command);
-      await handleFeedback(feedback, command, 'ESP32', {
-        setSpeaking: commands.length === 1,
-        tone: 'success',
-        speak: commands.length === 1,
-      });
+      return;
     }
 
-    if (commands.length > 1) {
+    if (controlAction.target.control === ACTION_CONTROL_TYPES.CANCEL) {
+      if (confirmationMachineRef.current.hasPending()) {
+        confirmationMachineRef.current.clear();
+        setPendingConfirmation(null);
+        updateStatusPanel('Confirmation', 'Okay, canceled.', 'pending');
+        await deliverAssistantMessage('Jarvis', 'Okay, canceled.', 'pending');
+        return;
+      }
+
+      if (actionQueueRef.current.isBusy()) {
+        actionQueueRef.current.cancel('Cancelled by user request.');
+        stopSpeechOutput();
+        await waitForActionQueueToSettle();
+        setQueueSnapshot({
+          busy: false,
+          lastRunStatus: ACTION_RESULT_STATUS.CANCELLED,
+          currentSummary: '',
+        });
+        updateStatusPanel('Queue', 'Okay, canceled.', 'pending');
+        await deliverAssistantMessage('Jarvis', 'Okay, canceled.', 'pending');
+        return;
+      }
+
+      updateStatusPanel('Queue', 'There is nothing to cancel right now.', 'pending');
       await deliverAssistantMessage(
         'Jarvis',
-        buildBatchSuccessMessage(commands),
-        'success'
-      );
-    }
-  };
-
-  const dispatchWebSocketCommands = async (commands) => {
-    for (let index = 0; index < commands.length; index += 1) {
-      updateStatusPanel(
-        'Dispatch',
-        `Queueing ${index + 1} of ${commands.length}: ${getDeviceLabel(
-          commands[index].device,
-          commands[index].location
-        )}.`,
+        'There is nothing to cancel right now.',
         'pending'
       );
-
-      await sendWebSocketCommand(commands[index]);
-
-      if (commands.length > 1 && index < commands.length - 1) {
-        await wait(220);
-      }
+      return;
     }
 
-    const queuedMessage = buildQueuedMessage(commands);
-    appendConversationEntry('assistant', 'Jarvis', queuedMessage, 'pending');
-    updateStatusPanel('ESP32', queuedMessage, 'pending');
-    resetActivitySoon(900);
+    if (controlAction.target.control === ACTION_CONTROL_TYPES.INTERRUPT) {
+      if (!settings.allowInterruptions) {
+        updateStatusPanel(
+          'Queue',
+          'Interruption is disabled in the admin panel settings.',
+          'error'
+        );
+        await deliverAssistantMessage(
+          'Jarvis',
+          'Interruption is disabled in the admin panel settings.',
+          'error'
+        );
+        return;
+      }
+
+      if (actionQueueRef.current.isBusy()) {
+        actionQueueRef.current.interrupt('Interrupted by user request.');
+        stopSpeechOutput();
+        await waitForActionQueueToSettle();
+        setQueueSnapshot({
+          busy: false,
+          lastRunStatus: ACTION_RESULT_STATUS.INTERRUPTED,
+          currentSummary: '',
+        });
+        updateStatusPanel('Queue', 'Interrupted the current action queue.', 'pending');
+        await deliverAssistantMessage(
+          'Jarvis',
+          'Interrupted the current action queue.',
+          'pending'
+        );
+        return;
+      }
+
+      updateStatusPanel('Queue', 'There is no active action queue to interrupt.', 'pending');
+      await deliverAssistantMessage(
+        'Jarvis',
+        'There is no active action queue to interrupt.',
+        'pending'
+      );
+    }
   };
 
   const processPrompt = async (prompt, source = 'typed') => {
-    let trimmedPrompt = prompt.trim();
-    let wakeWordPrompt = trimmedPrompt;
+    const rawTranscript = String(prompt || '');
+    const normalizedTranscript = normalizeFinalTranscript(rawTranscript);
+    let wakeWordStrippedTranscript = normalizedTranscript;
 
     if (source === 'voice') {
-      wakeWordPrompt = extractWakeWordPrompt(trimmedPrompt);
+      wakeWordStrippedTranscript = extractWakeWordPrompt(normalizedTranscript);
 
-      if (wakeWordPrompt === null) {
+      if (wakeWordStrippedTranscript === null) {
+        logRouteDecision({
+          rawTranscript,
+          normalizedTranscript,
+          wakeWordStrippedTranscript: '',
+          pendingConfirmationPresent: Boolean(
+            confirmationMachineRef.current.get()
+          ),
+          cancelCommandDetected: false,
+          parserMatched: false,
+          parsedActionsCount: 0,
+          parsedActionsPayload: [],
+          validationAcceptedCount: 0,
+          validationRejectedCount: 0,
+          chosenRoute: 'wake_word_ignored',
+          fallbackToAI: false,
+        });
         setRecognizedText('');
         updateStatusPanel(
           'Wake Word',
@@ -839,7 +1042,23 @@ function App() {
         return;
       }
 
-      if (!wakeWordPrompt) {
+      if (!wakeWordStrippedTranscript) {
+        logRouteDecision({
+          rawTranscript,
+          normalizedTranscript,
+          wakeWordStrippedTranscript: '',
+          pendingConfirmationPresent: Boolean(
+            confirmationMachineRef.current.get()
+          ),
+          cancelCommandDetected: false,
+          parserMatched: false,
+          parsedActionsCount: 0,
+          parsedActionsPayload: [],
+          validationAcceptedCount: 0,
+          validationRejectedCount: 0,
+          chosenRoute: 'wake_word_only',
+          fallbackToAI: false,
+        });
         setRecognizedText('');
         updateStatusPanel(
           'Wake Word',
@@ -848,14 +1067,38 @@ function App() {
         );
         return;
       }
-
-      trimmedPrompt = wakeWordPrompt;
     }
 
+    const trimmedPrompt = normalizeAutomationText(wakeWordStrippedTranscript);
     const fingerprint = normalizePromptFingerprint(trimmedPrompt);
     const now = Date.now();
+    const pendingRequest = confirmationMachineRef.current.get();
+    const detectedControl = detectControlCommand(trimmedPrompt);
+    const cancelCommandDetected =
+      detectedControl === ACTION_CONTROL_TYPES.CANCEL ||
+      detectedControl === ACTION_CONTROL_TYPES.INTERRUPT;
+    const buildRouteDecision = (overrides = {}) => ({
+      rawTranscript,
+      normalizedTranscript,
+      wakeWordStrippedTranscript,
+      pendingConfirmationPresent: Boolean(pendingRequest),
+      cancelCommandDetected,
+      parserMatched: false,
+      parsedActionsCount: 0,
+      parsedActionsPayload: [],
+      validationAcceptedCount: 0,
+      validationRejectedCount: 0,
+      chosenRoute: 'ai',
+      fallbackToAI: false,
+      ...overrides,
+    });
 
     if (!trimmedPrompt) {
+      logRouteDecision(
+        buildRouteDecision({
+          chosenRoute: 'empty',
+        })
+      );
       return;
     }
 
@@ -863,10 +1106,23 @@ function App() {
       lastAcceptedPromptRef.current.fingerprint === fingerprint &&
       now - lastAcceptedPromptRef.current.at < 2500
     ) {
+      logRouteDecision(
+        buildRouteDecision({
+          chosenRoute: 'duplicate_ignored',
+        })
+      );
       return;
     }
 
-    if (promptLockRef.current) {
+    if (
+      promptLockRef.current &&
+      (!settings.allowInterruptions || !actionQueueRef.current.isBusy())
+    ) {
+      logRouteDecision(
+        buildRouteDecision({
+          chosenRoute: 'busy',
+        })
+      );
       updateStatusPanel(
         'Busy',
         'Jarvis is still finishing the previous request. Please wait a moment.',
@@ -881,16 +1137,6 @@ function App() {
       at: now,
     };
 
-    stopSpeechOutput();
-
-    if (recognitionRef.current && recognitionActiveRef.current) {
-      try {
-        recognitionRef.current.stop();
-      } catch (error) {
-        // Ignore stop failures from repeated toggles.
-      }
-    }
-
     try {
       setRecognizedText(trimmedPrompt);
       appendConversationEntry(
@@ -900,9 +1146,103 @@ function App() {
         'user'
       );
 
-      const parsedResult = parseVoiceCommand(trimmedPrompt);
+      if (pendingRequest) {
+        if (detectedControl === ACTION_CONTROL_TYPES.CONFIRM) {
+          logRouteDecision(
+            buildRouteDecision({
+              chosenRoute: 'confirmation',
+              parserMatched: true,
+              pendingActionId: pendingRequest.actions[0]?.id || null,
+            })
+          );
+          await handleControlAction({
+            target: { control: ACTION_CONTROL_TYPES.CONFIRM },
+          });
+          return;
+        }
+
+        if (
+          detectedControl === ACTION_CONTROL_TYPES.CANCEL ||
+          detectedControl === ACTION_CONTROL_TYPES.INTERRUPT
+        ) {
+          logRouteDecision(
+            buildRouteDecision({
+              chosenRoute: 'cancel',
+              parserMatched: true,
+              pendingActionId: pendingRequest.actions[0]?.id || null,
+            })
+          );
+          await handleControlAction({
+            target: { control: detectedControl },
+          });
+          return;
+        }
+
+        logRouteDecision(
+          buildRouteDecision({
+            chosenRoute: 'confirmation',
+            pendingActionId: pendingRequest.actions[0]?.id || null,
+          })
+        );
+        updateStatusPanel(
+          'Confirmation',
+          'Please say yes to confirm or cancel to stop.',
+          'pending'
+        );
+        await deliverAssistantMessage(
+          'Jarvis',
+          'Please say yes to confirm or cancel to stop.',
+          'pending'
+        );
+        return;
+      }
+
+      if (
+        detectedControl === ACTION_CONTROL_TYPES.CANCEL ||
+        detectedControl === ACTION_CONTROL_TYPES.INTERRUPT
+      ) {
+        logRouteDecision(
+          buildRouteDecision({
+            chosenRoute: 'cancel',
+            parserMatched: true,
+          })
+        );
+        await handleControlAction({
+          target: { control: detectedControl },
+        });
+        return;
+      }
+
+      if (detectedControl === ACTION_CONTROL_TYPES.CONFIRM) {
+        logRouteDecision(
+          buildRouteDecision({
+            chosenRoute: 'confirmation',
+            parserMatched: true,
+          })
+        );
+        await handleControlAction({
+          target: { control: ACTION_CONTROL_TYPES.CONFIRM },
+        });
+        return;
+      }
+
+      const parsedResult = parsePromptToActions(trimmedPrompt, source);
+      const parsedActions = parsedResult.actions || [];
+      const controlAction = getSingleControlAction(parsedActions);
+      const localActions = parsedActions.filter(
+        (action) => action.type !== ACTION_TYPES.AI_QUERY
+      );
+      const aiActions = parsedActions.filter(
+        (action) => action.type === ACTION_TYPES.AI_QUERY
+      );
+      const parsedActionsPayload = serializeRouteActions(parsedActions);
 
       if (parsedResult.kind === 'empty') {
+        logRouteDecision(
+          buildRouteDecision({
+            chosenRoute: 'empty',
+          })
+        );
         return;
       }
 
@@ -915,84 +1255,213 @@ function App() {
         const panelTone =
           parsedResult.kind === 'device_not_found' ? 'error' : 'pending';
 
+        logRouteDecision(
+          buildRouteDecision({
+            parserMatched: true,
+            parsedActionsCount: parsedActions.length,
+            parsedActionsPayload,
+            validationRejectedCount: 1,
+            chosenRoute: 'automation',
+            reason: parsedResult.message,
+          })
+        );
         updateStatusPanel(panelLabel, parsedResult.message, panelTone);
         await deliverAssistantMessage('Jarvis', parsedResult.message, panelTone);
         return;
       }
 
-      setActivity('thinking');
-
-      if (parsedResult.kind === 'general') {
-        if (!aiEndpoint.trim()) {
-          updateStatusPanel(
-            'AI',
-            'AI backend not configured. Answering locally for now.',
-            'pending'
-          );
-
-          await wait(650);
-          await deliverAssistantMessage(
-            'Jarvis',
-            buildLocalAssistantReply(parsedResult.prompt),
-            'neutral'
-          );
-
-          return;
-        }
-
-        updateStatusPanel(
-          'AI',
-          'Sending this question to the secure AI backend.',
-          'pending'
+      if (controlAction) {
+        logRouteDecision(
+          buildRouteDecision({
+            parserMatched: true,
+            parsedActionsCount: parsedActions.length,
+            parsedActionsPayload,
+            chosenRoute:
+              controlAction.target.control === ACTION_CONTROL_TYPES.CONFIRM
+                ? 'confirmation'
+                : 'cancel',
+          })
         );
-
-        try {
-          const reply = await sendAiPrompt(parsedResult.prompt);
-          await deliverAssistantMessage('Jarvis AI', reply, 'success');
-        } catch (error) {
-          const fallbackReply = buildLocalAssistantReply(parsedResult.prompt);
-          const errorMessage = `AI backend unavailable. ${
-            error.message || 'Request failed.'
-          }`;
-
-          appendConversationEntry('assistant', 'Jarvis', errorMessage, 'error');
-          updateStatusPanel('AI', errorMessage, 'error');
-
-          await wait(450);
-          await deliverAssistantMessage('Jarvis', fallbackReply, 'neutral');
-        }
-
+        await handleControlAction(controlAction);
         return;
       }
 
-      const commands =
-        parsedResult.kind === 'device_batch'
-          ? parsedResult.commands
-          : [parsedResult.command];
-      const dispatchMessage = buildDispatchMessage(commands);
+      if (localActions.length) {
+        const validation = validateActionBatch(localActions);
+        const acceptedLocalActions = validation.results
+          .filter((entry) => entry.validation.ok)
+          .map((entry) => entry.action);
+        const rejectedLocalActions = validation.failures;
 
-      updateStatusPanel('Dispatch', dispatchMessage, 'pending');
+        if (!acceptedLocalActions.length) {
+          const validationMessage =
+            rejectedLocalActions[0]?.validation?.errors?.[0] ||
+            'Action validation failed.';
 
-      if (commands.length > 1) {
-        appendConversationEntry('assistant', 'Jarvis', dispatchMessage, 'pending');
-      }
-
-      try {
-        if (transportProtocol === 'http') {
-          await dispatchHttpCommands(commands);
+          logRouteDecision(
+            buildRouteDecision({
+              parserMatched: true,
+              parsedActionsCount: parsedActions.length,
+              parsedActionsPayload,
+              validationAcceptedCount: 0,
+              validationRejectedCount: rejectedLocalActions.length,
+              chosenRoute: 'automation',
+              reason: validationMessage,
+            })
+          );
+          updateStatusPanel('Validation', validationMessage, 'error');
+          await deliverAssistantMessage('Jarvis', validationMessage, 'error');
           return;
         }
 
-        await dispatchWebSocketCommands(commands);
-      } catch (error) {
-        await deliverAssistantMessage(
-          'Jarvis',
-          `Device unreachable. ${
-            error.message || 'The ESP32 did not respond.'
-          }`,
-          'error'
+        if (actionQueueRef.current.isBusy()) {
+          if (!settings.allowInterruptions) {
+            updateStatusPanel(
+              'Busy',
+              'Jarvis is still finishing the previous request. Please wait a moment.',
+              'pending'
+            );
+            return;
+          }
+
+          actionQueueRef.current.interrupt('Interrupted by a new request.');
+          stopSpeechOutput();
+          updateStatusPanel(
+            'Queue',
+            'Interrupting the previous request before starting the new one.',
+            'pending'
+          );
+          await waitForActionQueueToSettle();
+        }
+
+        const riskyActions = acceptedLocalActions.filter(
+          (action) =>
+            action.requiresConfirmation && settings.requireDangerousConfirmation
         );
+
+        if (riskyActions.length) {
+          const confirmationSummary = summarizeActionPlan(acceptedLocalActions);
+          const nextPendingRequest = confirmationMachineRef.current.set({
+            prompt: trimmedPrompt,
+            source,
+            actions: acceptedLocalActions,
+            summary: confirmationSummary,
+          });
+
+          logRouteDecision(
+            buildRouteDecision({
+              parserMatched: true,
+              parsedActionsCount: parsedActions.length,
+              parsedActionsPayload,
+              validationAcceptedCount: acceptedLocalActions.length,
+              validationRejectedCount: rejectedLocalActions.length,
+              chosenRoute: 'confirmation',
+              pendingActionId: nextPendingRequest.actions[0]?.id || null,
+            })
+          );
+          setPendingConfirmation(nextPendingRequest);
+          updateStatusPanel(
+            'Confirmation',
+            `Are you sure you want me to ${toSentenceCase(confirmationSummary)}? Say yes to confirm or cancel to stop.`,
+            'pending'
+          );
+          await deliverAssistantMessage(
+            'Jarvis',
+            `Are you sure you want me to ${toSentenceCase(confirmationSummary)}? Say yes to confirm or cancel to stop.`,
+            'pending'
+          );
+          return;
+        }
+
+        logRouteDecision(
+          buildRouteDecision({
+            parserMatched: true,
+            parsedActionsCount: parsedActions.length,
+            parsedActionsPayload,
+            validationAcceptedCount: acceptedLocalActions.length,
+            validationRejectedCount: rejectedLocalActions.length,
+            chosenRoute: 'automation',
+            fallbackToAI: false,
+          })
+        );
+        stopSpeechOutput();
+
+        if (recognitionRef.current && recognitionActiveRef.current) {
+          try {
+            recognitionRef.current.stop();
+          } catch (error) {
+            // Ignore stop failures from repeated toggles.
+          }
+        }
+
+        await runActionPlan(acceptedLocalActions, trimmedPrompt, source);
+        return;
       }
+
+      const validation = validateActionBatch(aiActions);
+
+      if (!validation.ok) {
+        const validationMessage =
+          validation.failures[0]?.validation?.errors?.[0] ||
+          'Action validation failed.';
+        logRouteDecision(
+          buildRouteDecision({
+            parsedActionsCount: parsedActions.length,
+            parsedActionsPayload,
+            validationAcceptedCount: 0,
+            validationRejectedCount: validation.failures.length,
+            chosenRoute: 'ai',
+            fallbackToAI: false,
+            reason: validationMessage,
+          })
+        );
+        updateStatusPanel('Validation', validationMessage, 'error');
+        await deliverAssistantMessage('Jarvis', validationMessage, 'error');
+        return;
+      }
+
+      if (actionQueueRef.current.isBusy()) {
+        if (!settings.allowInterruptions) {
+          updateStatusPanel(
+            'Busy',
+            'Jarvis is still finishing the previous request. Please wait a moment.',
+            'pending'
+          );
+          return;
+        }
+
+        actionQueueRef.current.interrupt('Interrupted by a new request.');
+        stopSpeechOutput();
+        updateStatusPanel(
+          'Queue',
+          'Interrupting the previous request before starting the new one.',
+          'pending'
+        );
+        await waitForActionQueueToSettle();
+      }
+
+      logRouteDecision(
+        buildRouteDecision({
+          parserMatched: false,
+          parsedActionsCount: parsedActions.length,
+          parsedActionsPayload,
+          validationAcceptedCount: aiActions.length,
+          validationRejectedCount: 0,
+          chosenRoute: 'ai',
+          fallbackToAI: true,
+        })
+      );
+      stopSpeechOutput();
+
+      if (recognitionRef.current && recognitionActiveRef.current) {
+        try {
+          recognitionRef.current.stop();
+        } catch (error) {
+          // Ignore stop failures from repeated toggles.
+        }
+      }
+
+      await runActionPlan(aiActions, trimmedPrompt, source);
     } finally {
       promptLockRef.current = false;
     }
@@ -1018,17 +1487,169 @@ function App() {
   }, [conversation, recognizedText]);
 
   useEffect(() => {
-    if (transportProtocol === 'websocket') {
-      disconnectWebSocket();
-      setConnectionStatus(
-        websocketEndpoint.trim() ? 'disconnected' : 'not_configured'
-      );
-      return;
+    let isActive = true;
+    const nextSessionId = getOrCreateSessionId();
+    currentSessionIdRef.current = nextSessionId;
+
+    const hydrateSettingsAndSession = async () => {
+      try {
+        const settingsSnapshot = await loadSettingsSnapshot(
+          initialAiEndpointRef.current
+        );
+
+        if (isActive) {
+          applySettingsSnapshot(settingsSnapshot.settings);
+          setSettingsSyncState({
+            hydrated: true,
+            saving: false,
+            error: '',
+          });
+        }
+      } catch (error) {
+        if (isActive) {
+          setSettingsSyncState({
+            hydrated: true,
+            saving: false,
+            error: error.message || 'Settings backend unavailable.',
+          });
+        }
+      }
+
+      try {
+        const inventory = await registerClientSession(
+          resolveSettingsApiUrl(initialAiEndpointRef.current),
+          nextSessionId,
+          buildClientSessionMetadata()
+        );
+
+        if (isActive) {
+          applySessionInventorySnapshot(inventory);
+        }
+      } catch (error) {
+        if (isActive) {
+          setSessionInventory({
+            currentSessionId: nextSessionId,
+            sessions: [],
+            loading: false,
+            saving: false,
+            error: error.message || 'Device session inventory is unavailable.',
+          });
+        }
+      }
+    };
+
+    hydrateSettingsAndSession();
+
+    return () => {
+      isActive = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    writeAutomationSettings(settings);
+  }, [settings]);
+
+  useEffect(() => {
+    writeActionLogs(actionLogs);
+  }, [actionLogs]);
+
+  useEffect(() => {
+    if (!settingsSyncState.hydrated) {
+      return undefined;
     }
 
-    disconnectWebSocket();
-    setConnectionStatus(httpEndpoint.trim() ? 'configured' : 'not_configured');
-  }, [transportProtocol, httpEndpoint, websocketEndpoint]);
+    if (skipNextSettingsSyncRef.current) {
+      skipNextSettingsSyncRef.current = false;
+      return undefined;
+    }
+
+    const patch = pendingSettingsPatchRef.current;
+
+    if (!patch) {
+      return undefined;
+    }
+
+    let isActive = true;
+    pendingSettingsPatchRef.current = null;
+    setSettingsSyncState((currentState) => ({
+      ...currentState,
+      saving: true,
+      error: '',
+    }));
+
+    patchSettingsSnapshot(aiEndpoint, patch)
+      .then((snapshot) => {
+        if (!isActive) {
+          return;
+        }
+
+        applySettingsSnapshot(snapshot.settings);
+        setSettingsSyncState({
+          hydrated: true,
+          saving: false,
+          error: '',
+        });
+      })
+      .catch((error) => {
+        if (!isActive) {
+          return;
+        }
+
+        setSettingsSyncState((currentState) => ({
+          ...currentState,
+          saving: false,
+          error: error.message || 'Settings sync failed.',
+        }));
+      });
+
+    return () => {
+      isActive = false;
+    };
+  }, [aiEndpoint, settings, settingsSyncState.hydrated]);
+
+  useEffect(() => {
+    setAiStatus((currentStatus) =>
+      !aiEndpoint.trim()
+        ? 'not_configured'
+        : currentStatus === 'connected'
+          ? 'connected'
+          : 'configured'
+    );
+  }, [aiEndpoint]);
+
+  useEffect(() => {
+    transportRef.current?.disconnect?.();
+
+    const nextTransport = createEsp32Transport({
+      useMockDevices: settings.useMockDevices,
+      transport: transportProtocol,
+      httpEndpoint,
+      websocketEndpoint,
+      timeoutMs: 4500,
+      retryCount: 1,
+      mockDeviceLatencyMs: settings.mockDeviceLatencyMs,
+      onHealthChange: setConnectionStatus,
+      onFeedback: (feedback) =>
+        transportFeedbackHandlerRef.current(feedback, null, 'ESP32', {
+          setSpeaking: true,
+          tone: 'success',
+          speak: true,
+        }),
+    });
+
+    transportRef.current = nextTransport;
+    setConnectionStatus(nextTransport.getHealth());
+
+    return () => {
+      nextTransport.disconnect?.();
+    };
+  }, [
+    settings.useMockDevices,
+    settings.mockDeviceLatencyMs,
+    transportProtocol,
+    httpEndpoint,
+    websocketEndpoint,
+  ]);
 
   useEffect(() => {
     if (
@@ -1043,6 +1664,44 @@ function App() {
     setTtsSupported(false);
     setSpeechOutputEnabled(false);
   }, []);
+
+  useEffect(() => {
+    if (!currentSessionIdRef.current) {
+      return undefined;
+    }
+
+    let isActive = true;
+
+    const refreshInventory = async () => {
+      try {
+        const inventory = await registerClientSession(
+          resolveSettingsApiUrl(aiEndpoint),
+          currentSessionIdRef.current,
+          buildClientSessionMetadata()
+        );
+
+        if (isActive) {
+          applySessionInventorySnapshot(inventory);
+        }
+      } catch (error) {
+        if (isActive) {
+          setSessionInventory((currentInventory) => ({
+            ...currentInventory,
+            loading: false,
+            saving: false,
+            error: error.message || 'Session inventory refresh failed.',
+          }));
+        }
+      }
+    };
+
+    const heartbeatId = window.setInterval(refreshInventory, 60000);
+
+    return () => {
+      isActive = false;
+      window.clearInterval(heartbeatId);
+    };
+  }, [aiEndpoint]);
 
   // eslint-disable-next-line react-hooks/exhaustive-deps
   useEffect(() => {
@@ -1163,7 +1822,7 @@ function App() {
     return () => {
       clearQueuedTimeouts();
       clearStreamAnimation();
-      disconnectWebSocket();
+      transportRef.current?.disconnect?.();
       cancelSpeechSynthesis();
 
       if (recognitionRef.current) {
@@ -1235,6 +1894,35 @@ function App() {
     };
   }, [adminPanelOpen]);
 
+  useEffect(() => {
+    if (!adminPanelOpen || !currentSessionIdRef.current) {
+      return undefined;
+    }
+
+    let isActive = true;
+
+    loadSessionInventory(aiEndpoint, currentSessionIdRef.current)
+      .then((inventory) => {
+        if (isActive) {
+          applySessionInventorySnapshot(inventory);
+        }
+      })
+      .catch((error) => {
+        if (isActive) {
+          setSessionInventory((currentInventory) => ({
+            ...currentInventory,
+            loading: false,
+            saving: false,
+            error: error.message || 'Failed to load session inventory.',
+          }));
+        }
+      });
+
+    return () => {
+      isActive = false;
+    };
+  }, [adminPanelOpen, aiEndpoint]);
+
   const handleVoiceToggle = () => {
     if (!speechSupported) {
       updateStatusPanel(
@@ -1264,8 +1952,148 @@ function App() {
     });
   };
 
+  const handleSettingInputChange = (field) => (event) => {
+    updateSettings({
+      [field]: event.target.value,
+    });
+  };
+
+  const handleNumericSettingChange = (field, minimum = 0) => (event) => {
+    const parsedValue = Number(event.target.value);
+
+    updateSettings({
+      [field]: Number.isFinite(parsedValue)
+        ? Math.max(minimum, parsedValue)
+        : minimum,
+    });
+  };
+
+  const handleBooleanSettingToggle = (field) => {
+    updateSettings({
+      [field]: !settings[field],
+    });
+  };
+
+  const handleLaptopPermissionToggle = (permissionKey) => {
+    updateSettings({
+      laptopPermissions: {
+        [permissionKey]: !settings.laptopPermissions[permissionKey],
+      },
+    });
+  };
+
+  const handleClearActionLogs = () => {
+    setActionLogs([]);
+  };
+
+  const handleRevokeSession = async (sessionId) => {
+    if (!sessionId || !currentSessionIdRef.current) {
+      return;
+    }
+
+    setSessionInventory((currentInventory) => ({
+      ...currentInventory,
+      saving: true,
+      error: '',
+    }));
+
+    try {
+      const inventory = await revokeSession(
+        aiEndpoint,
+        currentSessionIdRef.current,
+        sessionId
+      );
+
+      applySessionInventorySnapshot(inventory);
+      appendActionLog({
+        type: 'session_revoke',
+        summary: `Revoke session ${sessionId}`,
+        status: ACTION_RESULT_STATUS.SUCCESS,
+        message: 'Session access was revoked.',
+      });
+    } catch (error) {
+      setSessionInventory((currentInventory) => ({
+        ...currentInventory,
+        saving: false,
+        error: error.message || 'Failed to revoke the selected session.',
+      }));
+    }
+  };
+
+  const handleRevokeOtherSessions = async () => {
+    if (!currentSessionIdRef.current) {
+      return;
+    }
+
+    setSessionInventory((currentInventory) => ({
+      ...currentInventory,
+      saving: true,
+      error: '',
+    }));
+
+    try {
+      const inventory = await revokeOtherSessions(
+        aiEndpoint,
+        currentSessionIdRef.current
+      );
+
+      applySessionInventorySnapshot(inventory);
+      appendActionLog({
+        type: 'session_revoke_others',
+        summary: 'Revoke all other sessions',
+        status: ACTION_RESULT_STATUS.SUCCESS,
+        message: 'All other active sessions were revoked.',
+      });
+    } catch (error) {
+      setSessionInventory((currentInventory) => ({
+        ...currentInventory,
+        saving: false,
+        error: error.message || 'Failed to revoke other sessions.',
+      }));
+    }
+  };
+
+  const handleTransportTest = async () => {
+    const transport = transportRef.current;
+
+    if (!transport) {
+      updateStatusPanel('ESP32', 'Device transport is unavailable.', 'error');
+      return;
+    }
+
+    try {
+      updateStatusPanel('ESP32', 'Testing the active device transport.', 'pending');
+      const result = await transport.testConnection();
+      appendActionLog({
+        type: 'device_test',
+        summary: 'Test device transport',
+        status: result.status,
+        message: result.message,
+      });
+      await deliverAssistantMessage('Jarvis', result.message, 'success', {
+        speak: false,
+      });
+    } catch (error) {
+      appendActionLog({
+        type: 'device_test',
+        summary: 'Test device transport',
+        status: ACTION_RESULT_STATUS.ERROR,
+        message: error.message || 'Transport test failed.',
+      });
+      updateStatusPanel('ESP32', error.message || 'Transport test failed.', 'error');
+    }
+  };
+
+  const handleAdminPrompt = async (prompt) => {
+    await processPromptRef.current(prompt, 'typed');
+  };
+
   const controlsDisabled = activity === 'thinking';
-  const connectionCopy = getConnectionCopy(transportProtocol, connectionStatus);
+  const connectionCopy = getConnectionCopy(
+    transportProtocol,
+    connectionStatus,
+    settings.useMockDevices
+  );
   const aiConnectionCopy = getAiConnectionCopy(aiStatus);
   const voiceButtonLabel = !speechSupported
     ? 'Voice Unsupported'
@@ -1285,6 +2113,20 @@ function App() {
       ? 'Active'
       : 'Ready';
   const chatPanelToggleLabel = chatPanelOpen ? 'Hide AI Chat' : 'Show AI Chat';
+  const queueStatusCopy = queueSnapshot.busy
+    ? `Running: ${queueSnapshot.currentSummary || 'action queue'}`
+    : queueSnapshot.lastRunStatus === 'idle'
+      ? 'Idle'
+      : queueSnapshot.lastRunStatus;
+  const settingsApiUrl = resolveSettingsApiUrl(aiEndpoint);
+  const pendingConfirmationCopy = pendingConfirmation
+    ? pendingConfirmation.summary
+    : 'No action is waiting for confirmation.';
+  const currentSessionRecord =
+    sessionInventory.sessions.find((session) => session.isCurrent) || null;
+  const otherActiveSessions = sessionInventory.sessions.filter(
+    (session) => !session.isCurrent
+  );
   const adminIssues = [];
 
   if (!speechSupported) {
@@ -1362,6 +2204,30 @@ function App() {
     });
   }
 
+  if (pendingConfirmation) {
+    adminIssues.push({
+      tone: 'pending',
+      title: 'Pending Confirmation',
+      message: `Jarvis is waiting for confirmation before it can ${pendingConfirmation.summary}.`,
+    });
+  }
+
+  if (settingsSyncState.error) {
+    adminIssues.push({
+      tone: 'error',
+      title: 'Settings Sync Error',
+      message: settingsSyncState.error,
+    });
+  }
+
+  if (sessionInventory.error) {
+    adminIssues.push({
+      tone: 'error',
+      title: 'Session Inventory Error',
+      message: sessionInventory.error,
+    });
+  }
+
   if (!adminIssues.length) {
     adminIssues.push({
       tone: 'success',
@@ -1383,9 +2249,144 @@ function App() {
     ['Voice Capture', voiceEnabled ? 'Enabled' : 'Paused'],
     ['Speech Output', ttsSupported ? (speechOutputEnabled ? 'Enabled' : 'Muted') : 'Unavailable'],
     ['Current Activity', activity],
+    ['Action Queue', queueStatusCopy],
+    ['Pending Confirmation', pendingConfirmationCopy],
+    ['Settings API', settingsApiUrl],
+    ['Settings Sync', settingsSyncState.saving ? 'Saving' : settingsSyncState.hydrated ? 'Synced' : 'Loading'],
+    ['Current Session', currentSessionRecord?.label || currentSessionIdRef.current || 'Loading'],
+    ['Other Active Sessions', String(otherActiveSessions.length)],
     ['Status Panel', `${statusPanel.label}: ${statusPanel.message}`],
     ['Last Transcript', recognizedText || 'No transcript captured yet'],
     ['Current Reply', liveReply.message || 'No active reply'],
+  ];
+
+  const adminStatusCards = [
+    {
+      label: 'AI Backend',
+      value: aiConnectionCopy,
+      detail: aiEndpoint.trim() || 'No endpoint configured',
+    },
+    {
+      label: 'Device Transport',
+      value: connectionCopy,
+      detail: settings.useMockDevices
+        ? 'Mock ESP32 layer is active.'
+        : transportProtocol === 'http'
+          ? httpEndpoint.trim() || 'No HTTP endpoint configured'
+          : websocketEndpoint.trim() || 'No WebSocket endpoint configured',
+    },
+    {
+      label: 'Execution Queue',
+      value: queueStatusCopy,
+      detail: queueSnapshot.busy
+        ? 'Jarvis is currently working through a structured action run.'
+        : 'No actions are executing right now.',
+    },
+    {
+      label: 'Confirmation',
+      value: pendingConfirmation ? 'Waiting for confirmation' : 'Clear',
+      detail: pendingConfirmationCopy,
+    },
+    {
+      label: 'Session Inventory',
+      value: currentSessionRecord ? currentSessionRecord.label : 'Loading session data',
+      detail: otherActiveSessions.length
+        ? `${otherActiveSessions.length} other active session(s) detected.`
+        : 'No other active sessions are currently registered.',
+    },
+  ];
+
+  const adminQuickActions = [
+    {
+      label: 'Test Device Link',
+      onClick: handleTransportTest,
+      variant: 'primary',
+    },
+    {
+      label: 'Ask AI Test',
+      onClick: () => handleAdminPrompt('What can you do?'),
+      variant: 'secondary',
+    },
+    {
+      label: 'Mock Fan On',
+      onClick: () => handleAdminPrompt('Turn on the living room fan'),
+      variant: 'secondary',
+    },
+    {
+      label: 'Multi-Action Test',
+      onClick: () => handleAdminPrompt('Turn on the fan and open chrome'),
+      variant: 'secondary',
+    },
+  ];
+
+  if (pendingConfirmation) {
+    adminQuickActions.push({
+      label: 'Confirm Pending',
+      onClick: () => handleAdminPrompt('confirm'),
+      variant: 'primary',
+    });
+  }
+
+  if (pendingConfirmation || queueSnapshot.busy) {
+    adminQuickActions.push({
+      label: pendingConfirmation ? 'Cancel Pending' : 'Cancel Queue',
+      onClick: () => handleAdminPrompt('cancel'),
+      variant: 'danger',
+    });
+  }
+
+  if (queueSnapshot.busy && settings.allowInterruptions) {
+    adminQuickActions.push({
+      label: 'Interrupt Queue',
+      onClick: () => handleAdminPrompt('interrupt'),
+      variant: 'danger',
+    });
+  }
+
+  const laptopPermissionSettings = [
+    {
+      key: 'allowPower',
+      label: 'Allow Power Actions',
+      description: 'Shutdown, restart, and sleep actions.',
+    },
+    {
+      key: 'allowApps',
+      label: 'Allow App Automation',
+      description: 'Open and close supported desktop apps.',
+    },
+    {
+      key: 'allowUrls',
+      label: 'Allow URL Automation',
+      description: 'Open approved web links from voice commands.',
+    },
+    {
+      key: 'allowVolume',
+      label: 'Allow Volume Actions',
+      description: 'Mute, unmute, and volume adjustments.',
+    },
+  ];
+
+  const automationSwitches = [
+    {
+      key: 'useMockDevices',
+      label: 'Use Mock Devices',
+      description: 'Run the ESP32 layer in safe simulation mode.',
+    },
+    {
+      key: 'mockLaptopActions',
+      label: 'Mock Laptop Actions',
+      description: 'Simulate laptop automation instead of executing it on Windows.',
+    },
+    {
+      key: 'requireDangerousConfirmation',
+      label: 'Require Dangerous Confirmation',
+      description: 'Hold risky actions until you explicitly confirm them.',
+    },
+    {
+      key: 'allowInterruptions',
+      label: 'Allow Interruptions',
+      description: 'Let a new command interrupt the current queue.',
+    },
   ];
 
   const adminProcedure = [
@@ -1709,6 +2710,30 @@ function App() {
 
                 <section className="mt-6">
                   <div className="text-xs font-semibold uppercase tracking-[0.28em] text-cyan-100/75">
+                    System Status
+                  </div>
+                  <div className="mt-4 grid gap-4 md:grid-cols-2">
+                    {adminStatusCards.map((card) => (
+                      <div
+                        key={card.label}
+                        className="rounded-[1.6rem] border border-white/10 bg-white/5 p-5"
+                      >
+                        <div className="text-[0.68rem] font-semibold uppercase tracking-[0.24em] text-cyan-100/70">
+                          {card.label}
+                        </div>
+                        <div className="mt-3 text-lg font-semibold text-white">
+                          {card.value}
+                        </div>
+                        <div className="mt-3 break-words text-sm leading-6 text-slate-300">
+                          {card.detail}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </section>
+
+                <section className="mt-6">
+                  <div className="text-xs font-semibold uppercase tracking-[0.28em] text-cyan-100/75">
                     Problems And Issues
                   </div>
                   <div className="mt-4 grid gap-3">
@@ -1734,29 +2759,326 @@ function App() {
                   </div>
                 </section>
 
-                <section className="mt-6 grid gap-6 lg:grid-cols-2">
+                <section className="mt-6 grid gap-6 xl:grid-cols-[1.05fr_0.95fr]">
                   <div className="rounded-[1.6rem] border border-white/10 bg-white/5 p-5">
                     <div className="text-xs font-semibold uppercase tracking-[0.28em] text-cyan-100/75">
-                      Settings And Backend
+                      System Controls
                     </div>
-                    <div className="mt-4 space-y-3">
-                      {adminSettings.map(([label, value]) => (
-                        <div
-                          key={label}
-                          className="rounded-[1.1rem] border border-white/10 bg-slate-950/55 px-4 py-3"
-                        >
-                          <div className="text-[0.68rem] font-semibold uppercase tracking-[0.24em] text-cyan-100/70">
-                            {label}
-                          </div>
-                          <div className="mt-2 break-words text-sm leading-6 text-slate-200">
-                            {value}
-                          </div>
+                    <div className="mt-4 space-y-6">
+                      <div>
+                        <div className="text-[0.68rem] font-semibold uppercase tracking-[0.24em] text-cyan-100/70">
+                          Endpoint Configuration
                         </div>
-                      ))}
+                        <div className="mt-3 space-y-3">
+                          <label className="block">
+                            <span className="text-xs font-semibold uppercase tracking-[0.2em] text-slate-400">
+                              AI Endpoint
+                            </span>
+                            <input
+                              type="text"
+                              value={settings.aiEndpoint}
+                              onChange={handleSettingInputChange('aiEndpoint')}
+                              className="mt-2 w-full rounded-[1rem] border border-white/10 bg-slate-950/70 px-4 py-3 text-sm text-slate-100 outline-none transition focus:border-cyan-300/40"
+                              placeholder="http://localhost:3001/api/ai/chat"
+                            />
+                          </label>
+
+                          <div className="grid gap-3 md:grid-cols-[0.8fr_1fr]">
+                            <label className="block">
+                              <span className="text-xs font-semibold uppercase tracking-[0.2em] text-slate-400">
+                                Real Transport
+                              </span>
+                              <select
+                                value={settings.deviceTransport}
+                                onChange={handleSettingInputChange('deviceTransport')}
+                                className="mt-2 w-full rounded-[1rem] border border-white/10 bg-slate-950/70 px-4 py-3 text-sm text-slate-100 outline-none transition focus:border-cyan-300/40"
+                              >
+                                <option value="http">HTTP</option>
+                                <option value="websocket">WebSocket</option>
+                              </select>
+                            </label>
+
+                            <label className="block">
+                              <span className="text-xs font-semibold uppercase tracking-[0.2em] text-slate-400">
+                                Mock Device Latency (ms)
+                              </span>
+                              <input
+                                type="number"
+                                min="0"
+                                step="50"
+                                value={settings.mockDeviceLatencyMs}
+                                onChange={handleNumericSettingChange('mockDeviceLatencyMs', 0)}
+                                className="mt-2 w-full rounded-[1rem] border border-white/10 bg-slate-950/70 px-4 py-3 text-sm text-slate-100 outline-none transition focus:border-cyan-300/40"
+                              />
+                            </label>
+                          </div>
+
+                          <label className="block">
+                            <span className="text-xs font-semibold uppercase tracking-[0.2em] text-slate-400">
+                              ESP32 HTTP Endpoint
+                            </span>
+                            <input
+                              type="text"
+                              value={settings.httpEndpoint}
+                              onChange={handleSettingInputChange('httpEndpoint')}
+                              className="mt-2 w-full rounded-[1rem] border border-white/10 bg-slate-950/70 px-4 py-3 text-sm text-slate-100 outline-none transition focus:border-cyan-300/40"
+                              placeholder="http://192.168.x.x/command"
+                            />
+                          </label>
+
+                          <label className="block">
+                            <span className="text-xs font-semibold uppercase tracking-[0.2em] text-slate-400">
+                              ESP32 WebSocket Endpoint
+                            </span>
+                            <input
+                              type="text"
+                              value={settings.websocketEndpoint}
+                              onChange={handleSettingInputChange('websocketEndpoint')}
+                              className="mt-2 w-full rounded-[1rem] border border-white/10 bg-slate-950/70 px-4 py-3 text-sm text-slate-100 outline-none transition focus:border-cyan-300/40"
+                              placeholder="ws://192.168.x.x:81"
+                            />
+                          </label>
+                        </div>
+                      </div>
+
+                      <div>
+                        <div className="text-[0.68rem] font-semibold uppercase tracking-[0.24em] text-cyan-100/70">
+                          Safety And Behavior
+                        </div>
+                        <div className="mt-3 grid gap-3">
+                          {automationSwitches.map((item) => (
+                            <label
+                              key={item.key}
+                              className="flex items-start justify-between gap-4 rounded-[1.15rem] border border-white/10 bg-slate-950/55 px-4 py-4"
+                            >
+                              <div>
+                                <div className="text-sm font-semibold text-white">
+                                  {item.label}
+                                </div>
+                                <div className="mt-1 text-sm leading-6 text-slate-300">
+                                  {item.description}
+                                </div>
+                              </div>
+                              <input
+                                type="checkbox"
+                                checked={settings[item.key]}
+                                onChange={() => handleBooleanSettingToggle(item.key)}
+                                className="mt-1 h-5 w-5 rounded border-white/20 bg-slate-900 text-cyan-400"
+                              />
+                            </label>
+                          ))}
+                        </div>
+                      </div>
+
+                      <div>
+                        <div className="text-[0.68rem] font-semibold uppercase tracking-[0.24em] text-cyan-100/70">
+                          Laptop Permissions
+                        </div>
+                        <div className="mt-3 grid gap-3">
+                          {laptopPermissionSettings.map((item) => (
+                            <label
+                              key={item.key}
+                              className="flex items-start justify-between gap-4 rounded-[1.15rem] border border-white/10 bg-slate-950/55 px-4 py-4"
+                            >
+                              <div>
+                                <div className="text-sm font-semibold text-white">
+                                  {item.label}
+                                </div>
+                                <div className="mt-1 text-sm leading-6 text-slate-300">
+                                  {item.description}
+                                </div>
+                              </div>
+                              <input
+                                type="checkbox"
+                                checked={settings.laptopPermissions[item.key]}
+                                onChange={() => handleLaptopPermissionToggle(item.key)}
+                                className="mt-1 h-5 w-5 rounded border-white/20 bg-slate-900 text-cyan-400"
+                              />
+                            </label>
+                          ))}
+                        </div>
+                      </div>
                     </div>
                   </div>
 
                   <div className="space-y-6">
+                    <div className="rounded-[1.6rem] border border-white/10 bg-white/5 p-5">
+                      <div className="flex items-center justify-between gap-4">
+                        <div className="text-xs font-semibold uppercase tracking-[0.28em] text-cyan-100/75">
+                          Device Tests And Quick Actions
+                        </div>
+                        <div className="rounded-full border border-white/10 bg-slate-950/55 px-3 py-1 text-[0.68rem] font-semibold uppercase tracking-[0.22em] text-slate-300">
+                          {settings.useMockDevices ? 'Mock Path' : 'Live Path'}
+                        </div>
+                      </div>
+                      <div className="mt-4 grid gap-3 sm:grid-cols-2">
+                        {adminQuickActions.map((action) => (
+                          <button
+                            key={action.label}
+                            type="button"
+                            onClick={action.onClick}
+                            className={`rounded-[1.1rem] border px-4 py-3 text-left text-sm font-semibold transition ${
+                              action.variant === 'danger'
+                                ? 'border-rose-300/20 bg-rose-500/10 text-rose-50 hover:border-rose-200/35'
+                                : action.variant === 'primary'
+                                  ? 'border-cyan-300/20 bg-cyan-400/10 text-cyan-50 hover:border-cyan-200/35'
+                                  : 'border-white/10 bg-slate-950/55 text-slate-100 hover:border-white/20'
+                            }`}
+                          >
+                            {action.label}
+                          </button>
+                        ))}
+                      </div>
+                      <div className="mt-4 rounded-[1.1rem] border border-white/10 bg-slate-950/55 px-4 py-4 text-sm leading-6 text-slate-300">
+                        Use mock mode first to verify parsing, validation, routing, confirmation, and spoken replies without needing the real ESP32.
+                      </div>
+                    </div>
+
+                    <div className="rounded-[1.6rem] border border-white/10 bg-white/5 p-5">
+                      <div className="flex items-center justify-between gap-4">
+                        <div className="text-xs font-semibold uppercase tracking-[0.28em] text-cyan-100/75">
+                          Action Logs
+                        </div>
+                        <button
+                          type="button"
+                          onClick={handleClearActionLogs}
+                          className="rounded-full border border-white/10 bg-slate-950/55 px-3 py-1 text-[0.68rem] font-semibold uppercase tracking-[0.22em] text-slate-200 transition hover:border-white/20 hover:bg-white/10"
+                        >
+                          Clear Logs
+                        </button>
+                      </div>
+                      <div className="mt-4 max-h-[19rem] space-y-3 overflow-y-auto pr-1 no-scrollbar">
+                        {actionLogs.length ? (
+                          actionLogs.map((log) => (
+                            <div
+                              key={log.id}
+                              className="rounded-[1.1rem] border border-white/10 bg-slate-950/55 px-4 py-4"
+                            >
+                              <div className="flex flex-wrap items-center gap-2">
+                                <div className="text-sm font-semibold text-white">
+                                  {log.summary}
+                                </div>
+                                <div
+                                  className={`rounded-full px-2.5 py-1 text-[0.62rem] font-semibold uppercase tracking-[0.2em] ${
+                                    log.status === ACTION_RESULT_STATUS.SUCCESS ||
+                                    log.status === ACTION_RESULT_STATUS.MOCKED
+                                      ? 'bg-emerald-500/10 text-emerald-100'
+                                      : log.status === ACTION_RESULT_STATUS.ERROR ||
+                                          log.status === ACTION_RESULT_STATUS.DENIED
+                                        ? 'bg-rose-500/10 text-rose-100'
+                                        : 'bg-amber-500/10 text-amber-100'
+                                  }`}
+                                >
+                                  {log.status}
+                                </div>
+                              </div>
+                              <div className="mt-2 text-xs uppercase tracking-[0.22em] text-slate-500">
+                                {new Date(log.at).toLocaleString()}
+                              </div>
+                              <div className="mt-3 text-sm leading-6 text-slate-300">
+                                {log.message}
+                              </div>
+                            </div>
+                          ))
+                        ) : (
+                          <div className="rounded-[1.1rem] border border-white/10 bg-slate-950/55 px-4 py-4 text-sm leading-6 text-slate-300">
+                            No structured actions have been recorded yet.
+                          </div>
+                        )}
+                      </div>
+                    </div>
+
+                    <div className="rounded-[1.6rem] border border-white/10 bg-white/5 p-5">
+                      <div className="flex items-center justify-between gap-4">
+                        <div className="text-xs font-semibold uppercase tracking-[0.28em] text-cyan-100/75">
+                          Devices Settings
+                        </div>
+                        <button
+                          type="button"
+                          onClick={handleRevokeOtherSessions}
+                          disabled={
+                            sessionInventory.saving ||
+                            !otherActiveSessions.length ||
+                            sessionInventory.loading
+                          }
+                          className="rounded-full border border-white/10 bg-slate-950/55 px-3 py-1 text-[0.68rem] font-semibold uppercase tracking-[0.22em] text-slate-200 transition hover:border-white/20 hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-50"
+                        >
+                          Revoke Other Sessions
+                        </button>
+                      </div>
+
+                      <div className="mt-4 space-y-4">
+                        <div className="rounded-[1.1rem] border border-cyan-300/15 bg-slate-950/55 px-4 py-4">
+                          <div className="text-[0.68rem] font-semibold uppercase tracking-[0.24em] text-cyan-100/70">
+                            Current Session
+                          </div>
+                          {currentSessionRecord ? (
+                            <>
+                              <div className="mt-3 text-base font-semibold text-white">
+                                {currentSessionRecord.label}
+                              </div>
+                              <div className="mt-2 text-sm leading-6 text-slate-300">
+                                {currentSessionRecord.browser} on {currentSessionRecord.platform} · {currentSessionRecord.deviceType}
+                              </div>
+                              <div className="mt-2 text-xs uppercase tracking-[0.22em] text-slate-500">
+                                Last active {new Date(currentSessionRecord.lastSeenAt).toLocaleString()}
+                              </div>
+                            </>
+                          ) : (
+                            <div className="mt-3 text-sm leading-6 text-slate-300">
+                              {sessionInventory.loading
+                                ? 'Loading current session metadata...'
+                                : 'Current session metadata is unavailable.'}
+                            </div>
+                          )}
+                        </div>
+
+                        <div className="rounded-[1.1rem] border border-white/10 bg-slate-950/55 px-4 py-4">
+                          <div className="text-[0.68rem] font-semibold uppercase tracking-[0.24em] text-cyan-100/70">
+                            Other Active Sessions
+                          </div>
+                          <div className="mt-3 space-y-3">
+                            {otherActiveSessions.length ? (
+                              otherActiveSessions.map((session) => (
+                                <div
+                                  key={session.id}
+                                  className="rounded-[1rem] border border-white/10 bg-slate-900/70 px-4 py-4"
+                                >
+                                  <div className="flex items-start justify-between gap-4">
+                                    <div>
+                                      <div className="text-sm font-semibold text-white">
+                                        {session.label}
+                                      </div>
+                                      <div className="mt-2 text-sm leading-6 text-slate-300">
+                                        {session.browser} on {session.platform} · {session.deviceType}
+                                      </div>
+                                      <div className="mt-2 text-xs uppercase tracking-[0.22em] text-slate-500">
+                                        Last active {new Date(session.lastSeenAt).toLocaleString()}
+                                      </div>
+                                    </div>
+                                    <button
+                                      type="button"
+                                      onClick={() => handleRevokeSession(session.id)}
+                                      disabled={sessionInventory.saving}
+                                      className="rounded-full border border-rose-300/20 bg-rose-500/10 px-3 py-2 text-[0.68rem] font-semibold uppercase tracking-[0.22em] text-rose-50 transition hover:border-rose-200/35 disabled:cursor-not-allowed disabled:opacity-50"
+                                    >
+                                      Revoke
+                                    </button>
+                                  </div>
+                                </div>
+                              ))
+                            ) : (
+                              <div className="text-sm leading-6 text-slate-300">
+                                {sessionInventory.loading
+                                  ? 'Loading other active sessions...'
+                                  : 'No other active sessions were found.'}
+                              </div>
+                            )}
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+
                     <div className="rounded-[1.6rem] border border-white/10 bg-white/5 p-5">
                       <div className="text-xs font-semibold uppercase tracking-[0.28em] text-cyan-100/75">
                         Procedure
@@ -1793,17 +3115,35 @@ function App() {
 
                 <section className="mt-6 rounded-[1.6rem] border border-white/10 bg-white/5 p-5">
                   <div className="text-xs font-semibold uppercase tracking-[0.28em] text-cyan-100/75">
-                    Troubleshooting
+                    Settings Snapshot And Troubleshooting
                   </div>
-                  <div className="mt-4 grid gap-3 md:grid-cols-2">
-                    {adminTroubleshooting.map((item) => (
+                  <div className="mt-4 grid gap-6 xl:grid-cols-[0.95fr_1.05fr]">
+                    <div className="grid gap-3">
+                      {adminSettings.map(([label, value]) => (
+                        <div
+                          key={label}
+                          className="rounded-[1.1rem] border border-white/10 bg-slate-950/55 px-4 py-3"
+                        >
+                          <div className="text-[0.68rem] font-semibold uppercase tracking-[0.24em] text-cyan-100/70">
+                            {label}
+                          </div>
+                          <div className="mt-2 break-words text-sm leading-6 text-slate-200">
+                            {value}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+
+                    <div className="grid gap-3 md:grid-cols-2">
+                      {adminTroubleshooting.map((item) => (
                       <div
                         key={item}
                         className="rounded-[1.1rem] border border-white/10 bg-slate-950/55 px-4 py-3 text-sm leading-6 text-slate-200"
                       >
                         {item}
                       </div>
-                    ))}
+                      ))}
+                    </div>
                   </div>
                 </section>
               </div>

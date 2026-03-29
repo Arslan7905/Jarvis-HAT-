@@ -1,0 +1,34 @@
+{
+  "version": 1,
+  "settings": {
+    "aiEndpoint": "http://localhost:3001/api/ai/chat",
+    "deviceTransport": "websocket",
+    "httpEndpoint": "",
+    "websocketEndpoint": "",
+    "useMockDevices": true,
+    "mockDeviceLatencyMs": 450,
+    "allowInterruptions": true,
+    "requireDangerousConfirmation": true,
+    "mockLaptopActions": true,
+    "laptopPermissions": {
+      "allowPower": false,
+      "allowApps": true,
+      "allowUrls": true,
+      "allowVolume": true
+    }
+  },
+  "sessions": {
+    "sess_187d60dd-095c-416e-8964-cb334dd649db": {
+      "label": "Windows Device",
+      "browser": "Microsoft Edge",
+      "platform": "Windows",
+      "deviceType": "desktop",
+      "appName": "JarvisAI Web",
+      "appVersion": "dev",
+      "id": "sess_187d60dd-095c-416e-8964-cb334dd649db",
+      "createdAt": "2026-03-27T09:21:31.457Z",
+      "lastSeenAt": "2026-03-29T15:31:10.055Z",
+      "revokedAt": null
+    }
+  }
+}
